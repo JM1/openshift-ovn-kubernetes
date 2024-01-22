@@ -57,6 +57,51 @@ const udpPacketAggregationTimeout = 50 * time.Microsecond
 
 var udpPacketAggregationTimeoutBytes = []byte(fmt.Sprintf("%d\n", udpPacketAggregationTimeout.Nanoseconds()))
 
+func disableVethTxChecksumming(ifname string) error {
+	e, err := ethtool.NewEthtool()
+	if err != nil {
+		return fmt.Errorf("failed to initialize ethtool: %v", err)
+	}
+	defer e.Close()
+
+	features, err := e.Features(ifname)
+	if err != nil {
+		return fmt.Errorf("could not list interface features: %v", err)
+	}
+
+	changes := make(map[string]bool)
+	for featureName, toEnable := range map[string]bool{
+		"tx-checksum-ipv4":             false,
+		"tx-checksum-ip-generic":       false,
+		"tx-checksum-ipv6":             false,
+		"tx-checksum-fcoe-crc":         false,
+		"tx-checksum-sctp":             false,
+		"tx-tcp-segmentation":          false,
+		"tx-tcp-ecn-segmentation":      false,
+		"tx-tcp-mangleid-segmentation": false,
+		"tx-tcp6-segmentation":         false,
+		"tx-generic-segmentation":      false,
+		"rx-gro":                       false,
+		"rx-udp-gro-forwarding":        false,
+	} {
+		isEnabled, exists := features[featureName]
+		if exists && isEnabled != toEnable {
+			changes[featureName] = toEnable
+		}
+	}
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	err = e.Change(ifname, changes)
+	if err != nil {
+		return fmt.Errorf("could not disable interface features: %v", err)
+	}
+
+	return nil
+}
+
 // sets up the host side of a veth for UDP packet aggregation
 func setupVethUDPAggregationHost(ifname string) error {
 	e, err := ethtool.NewEthtool()
@@ -246,6 +291,11 @@ func setupInterface(netns ns.NetNS, containerID, ifName string, ifInfo *PodInter
 			}
 		}
 
+		err = disableVethTxChecksumming(contIface.Name)
+		if err != nil {
+			return fmt.Errorf("could not disable TX checksumming on container veth interface %q: %v", hostIface.Name, err)
+		}
+
 		oldHostVethName = hostVeth.Name
 
 		// to generate the unique host interface name, postfix it with the podInterface index for non-default network
@@ -272,6 +322,11 @@ func setupInterface(netns ns.NetNS, containerID, ifName string, ifInfo *PodInter
 		if err != nil {
 			return nil, nil, fmt.Errorf("could not enable UDP packet aggregation on host veth interface %q: %v", hostIface.Name, err)
 		}
+	}
+
+	err = disableVethTxChecksumming(hostIface.Name)
+	if err != nil {
+		return nil, nil, fmt.Errorf("could not disable TX checksumming on host veth interface %q: %v", hostIface.Name, err)
 	}
 
 	return hostIface, contIface, nil

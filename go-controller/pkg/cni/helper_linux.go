@@ -6,18 +6,19 @@ package cni
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"k8s.io/klog/v2"
-
+	"github.com/k8snetworkplumbingwg/govdpa/pkg/kvdpa"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
+	"k8s.io/klog/v2"
+	kexec "k8s.io/utils/exec"
 
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/plugins/pkg/ip"
@@ -56,6 +57,51 @@ func (defaultCNIPluginLibOps) SetupVeth(contVethName string, hostVethName string
 const udpPacketAggregationTimeout = 50 * time.Microsecond
 
 var udpPacketAggregationTimeoutBytes = []byte(fmt.Sprintf("%d\n", udpPacketAggregationTimeout.Nanoseconds()))
+
+func disableTxChecksumming(ifname string) error {
+	e, err := ethtool.NewEthtool()
+	if err != nil {
+		return fmt.Errorf("failed to initialize ethtool: %v", err)
+	}
+	defer e.Close()
+
+	features, err := e.Features(ifname)
+	if err != nil {
+		return fmt.Errorf("could not list interface features: %v", err)
+	}
+
+	changes := make(map[string]bool)
+	for featureName, toEnable := range map[string]bool{
+		"tx-checksum-ipv4":             false,
+		"tx-checksum-ip-generic":       false,
+		"tx-checksum-ipv6":             false,
+		"tx-checksum-fcoe-crc":         false,
+		"tx-checksum-sctp":             false,
+		"tx-tcp-segmentation":          false,
+		"tx-tcp-ecn-segmentation":      false,
+		"tx-tcp-mangleid-segmentation": false,
+		"tx-tcp6-segmentation":         false,
+		"tx-generic-segmentation":      false,
+		"rx-gro":                       false,
+		"rx-udp-gro-forwarding":        false,
+	} {
+		isEnabled, exists := features[featureName]
+		if exists && isEnabled != toEnable {
+			changes[featureName] = toEnable
+		}
+	}
+
+	if len(changes) == 0 {
+		return nil
+	}
+
+	err = e.Change(ifname, changes)
+	if err != nil {
+		return fmt.Errorf("could not disable interface features: %v", err)
+	}
+
+	return nil
+}
 
 // sets up the host side of a veth for UDP packet aggregation
 func setupVethUDPAggregationHost(ifname string) error {
@@ -205,7 +251,161 @@ func setupNetwork(link netlink.Link, ifInfo *PodInterfaceInfo) error {
 	return nil
 }
 
-func setupInterface(netns ns.NetNS, containerID, ifName string, ifInfo *PodInterfaceInfo) (*current.Interface, *current.Interface, error) {
+func prepareVDUSEInterfaceName(containerID, netName string) (string, error) {
+	// NOTE: Name must be reproducable otherwise device cannot be identified reliably during UnconfigureInterface!
+
+	if netName == types.DefaultNetworkName {
+		return containerID[:15], nil
+	}
+
+	// Use hash of name of secondary network to derive interface name
+
+	h := fnv.New32a()
+	_, err := h.Write([]byte(netName))
+	if err != nil {
+		return "", fmt.Errorf("failed to hash %s while generating vduse name: %v", netName, err)
+	}
+
+	suffix := fmt.Sprintf("_%d", h.Sum32())
+	return containerID[:(15-len(suffix))] + suffix, nil
+
+	//entropy := make([]byte, 4)
+	//_, err := rand.Read(entropy)
+	//if err != nil {
+	//	return "", fmt.Errorf("failed to generate random vduse name: %v", err)
+	//}
+	//
+	//suffix := fmt.Sprintf("_%x", entropy)
+	//return containerID[:(15-len(suffix))] + suffix, nil
+}
+
+func setupVDUSEInterface(netns ns.NetNS, containerID, ifName string, ifInfo *PodInterfaceInfo, hostIfaceName string) (*current.Interface, *current.Interface, error) {
+	hostIface := &current.Interface{}
+	contIface := &current.Interface{}
+
+	hostIface.Name = hostIfaceName
+
+	// TODO: hostIface.Mac = ?
+
+	vdpaArgs := []string{
+		"dev", "add", "name", hostIfaceName, "mgmtdev", "vduse",
+		// TODO: Replace call to util.GetNetLinkOps().LinkSetMTU() with the following code:
+		// "mtu", strconv.Itoa(ifInfo.MTU),
+	}
+
+	// TODO: Replace call to util.GetNetLinkOps().LinkSetHardwareAddr() with the following code:
+	//if ifInfo.MAC.String() != "" {
+	//	vdpaArgs = append(vdpaArgs, "mac", ifInfo.MAC.String())
+	//}
+
+	runner := kexec.New()
+	output, err := runner.Command("vdpa", vdpaArgs...).CombinedOutput()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to attach %s to vDPA bus: %s\n  %s", hostIfaceName, err, output)
+	}
+
+	// TODO: Extend kvdpa.AddVdpaDevice to allow specifying a MAC address and MTU
+	// err := kvdpa.AddVdpaDevice("vduse", hostIfaceName)
+	// if err != nil {
+	//	return nil, nil, fmt.Errorf("failed to attach %s to vDPA bus: %s", hostIfaceName, err)
+	// }
+
+	vdpaDevs, err := kvdpa.GetVdpaDevicesByMgmtDev("", "vduse")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to list vduse device(s) for %s: %s", hostIfaceName, err)
+	}
+
+	var vdpaDev kvdpa.VdpaDevice
+	for _, dev := range vdpaDevs {
+		if dev.Name() == hostIfaceName {
+			vdpaDev = dev
+		}
+	}
+
+	if vdpaDev == nil {
+		return nil, nil, fmt.Errorf("failed to find vduse device %s in list: %s", hostIfaceName, vdpaDevs)
+	}
+
+	if vdpaDev.VirtioNet() == nil || vdpaDev.VirtioNet().NetDev() == "" {
+		return nil, nil, fmt.Errorf("failed to read netdev for vduse device %s", hostIfaceName)
+	}
+
+	vdpaNetDevName := vdpaDev.VirtioNet().NetDev()
+
+	contNetDevName, err := safeMoveIfToNetns(vdpaNetDevName, netns, containerID)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"failed to move netdev %s for vduse device %s to net ns %s: %s", vdpaNetDevName, hostIfaceName, netns, err)
+	}
+
+	err = netns.Do(func(hostNS ns.NetNS) error {
+		err = renameLink(contNetDevName, ifName)
+		if err != nil {
+			return fmt.Errorf("failed to rename netdev %s to %s for vduse device %s: %v",
+				contNetDevName, ifName, hostIfaceName, err)
+		}
+
+		contLink, err := netlink.LinkByName(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to lookup netdev %s for vduse device %s: %v",
+				ifName, hostIfaceName, err)
+		}
+
+		err = util.GetNetLinkOps().LinkSetHardwareAddr(contLink, ifInfo.MAC)
+		if err != nil {
+			return fmt.Errorf("failed to set mac address %s for netdev %s / vduse device %s: %v", ifInfo.MAC, ifName, hostIfaceName, err)
+		}
+
+		err = util.GetNetLinkOps().LinkSetMTU(contLink, ifInfo.MTU)
+		if err != nil {
+			return fmt.Errorf("failed to set MTU %d for netdev %s / vduse device %s: %v", ifInfo.MTU, ifName, hostIfaceName, err)
+		}
+
+		err = netlink.LinkSetUp(contLink)
+		if err != nil {
+			return fmt.Errorf("failed to enable netdev %s / vduse device %s: %v", ifName, hostIfaceName, err)
+		}
+
+		err = setupNetwork(contLink, ifInfo)
+		if err != nil {
+			return fmt.Errorf("failed to set up network for netdev %s / vduse device %s: %v", ifName, hostIfaceName, err)
+		}
+
+		err = disableTxChecksumming(ifName)
+		if err != nil {
+			return fmt.Errorf("could not disable TX checksumming on container vduse interface %q: %v", ifName, err)
+		}
+
+		// Refresh mac address for netdev
+		contLink, err = netlink.LinkByName(ifName)
+		if err != nil {
+			return fmt.Errorf("failed to refresh attrs for netdev %s (vduse device %s): %v", ifName, hostIfaceName, err)
+		}
+
+		contLinkAddrs := contLink.Attrs()
+		contIface.Name = contLinkAddrs.Name
+
+		contIface.Mac = contLinkAddrs.HardwareAddr.String()
+		if !strings.EqualFold(contIface.Mac, ifInfo.MAC.String()) {
+			return fmt.Errorf("unexpected configuration, container netdev mac %s is not what it is supposed to be: %s",
+				contIface.Mac, ifInfo.MAC.String())
+		}
+		contIface.Sandbox = netns.Path()
+
+		// TODO: Act on ifInfo.EnableUDPAggregation?
+
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// TODO: Act on ifInfo.EnableUDPAggregation?
+
+	return hostIface, contIface, nil
+}
+
+func setupVethInterface(netns ns.NetNS, containerID, ifName string, ifInfo *PodInterfaceInfo) (*current.Interface, *current.Interface, error) {
 	hostIface := &current.Interface{}
 	contIface := &current.Interface{}
 	ifnameSuffix := ""
@@ -422,7 +622,7 @@ func getPfEncapIP(deviceID string) (string, error) {
 
 // ConfigureOVS performs OVS configurations in order to set up Pod networking
 func ConfigureOVS(ctx context.Context, namespace, podName, hostIfaceName string,
-	ifInfo *PodInterfaceInfo, sandboxID, deviceID string, getter PodInfoGetter) error {
+	ifInfo *PodInterfaceInfo, sandboxID, deviceID string, getter PodInfoGetter, isVDUSE bool, isDOCA bool) error {
 
 	ifaceID := util.GetIfaceId(namespace, podName)
 	if ifInfo.NetName != types.DefaultNetworkName {
@@ -434,13 +634,8 @@ func ConfigureOVS(ctx context.Context, namespace, podName, hostIfaceName string,
 		ipStrs[i] = ip.String()
 	}
 
-	br_type, err := getDatapathType("br-int")
-	if err != nil {
-		return fmt.Errorf("failed to get datapath type for bridge br-int : %v", err)
-	}
-
-	klog.Infof("ConfigureOVS: namespace: %s, podName: %s, hostIfaceName: %s, network: %s, NAD %s, SandboxID: %q, PCI device ID: %s, UID: %q, MAC: %s, IPs: %v",
-		namespace, podName, hostIfaceName, ifInfo.NetName, ifInfo.NADName, sandboxID, deviceID, initialPodUID, ifInfo.MAC, ipStrs)
+	klog.Infof("ConfigureOVS: namespace: %s, podName: %s, hostIfaceName: %s, network: %s, NAD %s, SandboxID: %q, PCI device ID: %s, UID: %q, MAC: %s, IPs: %v, isVDUSE: %v, isDOCA: %v",
+		namespace, podName, hostIfaceName, ifInfo.NetName, ifInfo.NADName, sandboxID, deviceID, initialPodUID, ifInfo.MAC, ipStrs, isVDUSE, isDOCA)
 
 	// Find and remove any existing OVS port with this iface-id. Pods can
 	// have multiple sandboxes if some are waiting for garbage collection,
@@ -508,7 +703,13 @@ func ConfigureOVS(ctx context.Context, namespace, podName, hostIfaceName string,
 		ovsArgs = append(ovsArgs, fmt.Sprintf("external_ids:ip_addresses=%s", strings.Join(ipStrs, ",")))
 	}
 
-	if br_type == types.DatapathUserspace {
+	if isVDUSE {
+		ovsArgs = append(ovsArgs,
+			"type=dpdkvhostuserclient",
+			fmt.Sprintf("options:vhost-server-path=/dev/vduse/%s", hostIfaceName))
+	}
+
+	if isDOCA {
 		_, err := util.GetSriovnetOps().GetRepresentorPortFlavour(hostIfaceName)
 		if err != nil {
 			// The error is not important: the given port is not a switchdev one and won't
@@ -546,13 +747,16 @@ func ConfigureOVS(ctx context.Context, namespace, podName, hostIfaceName string,
 	}
 
 	if ifInfo.Ingress > 0 || ifInfo.Egress > 0 {
-		l, err := netlink.LinkByName(hostIfaceName)
-		if err != nil {
-			return fmt.Errorf("failed to find host veth interface %s: %v", hostIfaceName, err)
-		}
-		err = netlink.LinkSetTxQLen(l, 1000)
-		if err != nil {
-			return fmt.Errorf("failed to set host veth txqlen: %v", err)
+		if !isVDUSE {
+			// TODO: What about netdev datapath?
+			l, err := netlink.LinkByName(hostIfaceName)
+			if err != nil {
+				return fmt.Errorf("failed to find host veth interface %s: %v", hostIfaceName, err)
+			}
+			err = netlink.LinkSetTxQLen(l, 1000)
+			if err != nil {
+				return fmt.Errorf("failed to set host veth txqlen: %v", err)
+			}
 		}
 
 		if err := setPodBandwidth(sandboxID, hostIfaceName, ifInfo.Ingress, ifInfo.Egress); err != nil {
@@ -560,13 +764,6 @@ func ConfigureOVS(ctx context.Context, namespace, podName, hostIfaceName string,
 		}
 	}
 
-	if err := waitForPodInterface(ctx, ifInfo, hostIfaceName, ifaceID, getter,
-		namespace, podName, initialPodUID); err != nil {
-		// Ensure the error shows up in node logs, rather than just
-		// being reported back to the runtime.
-		klog.Warningf("[%s/%s %s] pod uid %s: %v", namespace, podName, sandboxID, initialPodUID, err)
-		return err
-	}
 	return nil
 }
 
@@ -581,52 +778,111 @@ var podRequestInterfaceOps PodRequestInterfaceOps = &defaultPodRequestInterfaceO
 
 // ConfigureInterface sets up the container interface
 func (*defaultPodRequestInterfaceOps) ConfigureInterface(pr *PodRequest, getter PodInfoGetter, ifInfo *PodInterfaceInfo) ([]*current.Interface, error) {
+	// TODO: Remove hack
+	klog.Errorf("Creating interface (%+v) %s", *pr, fmt.Sprintf("for pod %s/%s NAD %s", pr.PodNamespace, pr.PodName, pr.nadName))
+
 	netns, err := ns.GetNS(pr.Netns)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open netns %q: %v", pr.Netns, err)
 	}
 	defer netns.Close()
 
+	stdout, err := ovsGet("Open_vSwitch", ".", "other_config", "dpdk-init")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OVS' other_config:dpdk-init, error: %v", err)
+	}
+	ovsDPDKInit := (stdout == "true")
+
+	stdout, err = ovsGet("Open_vSwitch", ".", "other_config", "doca-init")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get OVS' other_config:doca-init, error: %v", err)
+	}
+	ovsDOCAInit := (stdout == "true")
+
+	dpType, err := getDatapathType("br-int")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get datapath type for bridge br-int : %v", err)
+	}
+
+	if dpType != types.DatapathSystem && dpType != types.DatapathUserspace {
+		return nil, fmt.Errorf("br-int has unknown datapath type: %v", dpType)
+	}
+
+	if dpType == types.DatapathUserspace && ifInfo.IsDPUHostMode {
+		return nil, fmt.Errorf("unexpected configuration, pod request on dpu host with netdev datapath")
+	}
+
+	isVDUSE := ovsDPDKInit && (dpType == types.DatapathUserspace)
+	isDOCA := ovsDOCAInit && (dpType == types.DatapathUserspace)
+
+	if isVDUSE && isDOCA {
+		return nil, fmt.Errorf("unexpected configuration, both VDUSE and DOCA are enabled")
+	}
+
 	var hostIface, contIface *current.Interface
+	var hostIfName string
 
 	klog.V(5).Infof("CNI Conf %v", pr.CNIConf)
 	if pr.CNIConf.DeviceID != "" {
 		// SR-IOV Case
+		if dpType != types.DatapathSystem {
+			return nil, fmt.Errorf("SR-IOV not supported with datapath type %v", dpType)
+		}
+
 		hostIface, contIface, err = setupSriovInterface(netns, pr.SandboxID, pr.IfName, ifInfo, pr.CNIConf.DeviceID, pr.IsVFIO)
+		hostIfName = hostIface.Name
 	} else {
 		if ifInfo.IsDPUHostMode {
 			return nil, fmt.Errorf("unexpected configuration, pod request on dpu host. " +
 				"device ID must be provided")
 		}
+
 		// General case
-		hostIface, contIface, err = setupInterface(netns, pr.SandboxID, pr.IfName, ifInfo)
+		if dpType == types.DatapathSystem {
+			// Veth
+			hostIface, contIface, err = setupVethInterface(netns, pr.SandboxID, pr.IfName, ifInfo)
+			hostIfName = hostIface.Name
+		} else if isVDUSE {
+			// VDUSE
+			hostIfName, err = prepareVDUSEInterfaceName(pr.SandboxID, ifInfo.NetName)
+
+			// TODO: Remove hack!
+			klog.Errorf("Creating vduse dev %s (pr.netName: %s, ifInfo.NetName: %s)", hostIfName, pr.netName, ifInfo.NetName)
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	// OCP HACK: block access to MCS/metadata; https://github.com/openshift/ovn-kubernetes/pull/19
-	var wg sync.WaitGroup
-	var iptErr error
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		iptErr = setupIPTablesBlocks(netns, ifInfo)
-	}()
-	// END OCP HACK
-
 	if !ifInfo.IsDPUHostMode {
-		err = ConfigureOVS(pr.ctx, pr.PodNamespace, pr.PodName, hostIface.Name, ifInfo, pr.SandboxID, pr.CNIConf.DeviceID, getter)
+		err = ConfigureOVS(pr.ctx, pr.PodNamespace, pr.PodName, hostIfName, ifInfo, pr.SandboxID, pr.CNIConf.DeviceID, getter, isVDUSE, isDOCA)
+		if err == nil && isVDUSE {
+			hostIface, contIface, err = setupVDUSEInterface(netns, pr.SandboxID, pr.IfName, ifInfo, hostIfName)
+		}
+
+		if err == nil {
+			ifaceID := util.GetIfaceId(pr.PodNamespace, pr.PodName)
+			if ifInfo.NetName != types.DefaultNetworkName {
+				ifaceID = util.GetSecondaryNetworkIfaceId(pr.PodNamespace, pr.PodName, ifInfo.NADName)
+			}
+			err = waitForPodInterface(pr.ctx, ifInfo, hostIfName, ifaceID, getter, pr.PodNamespace, pr.PodName, ifInfo.PodUID)
+			if err != nil {
+				// Ensure the error shows up in node logs, rather than just
+				// being reported back to the runtime.
+				klog.Warningf("[%s/%s %s] pod uid %s: %v", pr.PodNamespace, pr.PodName, pr.SandboxID, ifInfo.PodUID, err)
+			}
+		}
+
 		if err != nil {
-			pr.deletePort(hostIface.Name, pr.PodNamespace, pr.PodName)
+			pr.deletePort(hostIfName, pr.PodNamespace, pr.PodName, isVDUSE)
 			return nil, err
 		}
 	}
 
 	// OCP HACK: block access to MCS/metadata; https://github.com/openshift/ovn-kubernetes/pull/19
-	wg.Wait()
-	if iptErr != nil {
-		return nil, iptErr
+	err = setupIPTablesBlocks(netns, ifInfo)
+	if err != nil {
+		return nil, err
 	}
 	// END OCP HACK
 
@@ -672,6 +928,31 @@ func (*defaultPodRequestInterfaceOps) ConfigureInterface(pr *PodRequest, getter 
 func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInfo *PodInterfaceInfo) error {
 	podDesc := fmt.Sprintf("for pod %s/%s NAD %s", pr.PodNamespace, pr.PodName, pr.nadName)
 	klog.V(5).Infof("Tear down interface (%+v) %s", *pr, podDesc)
+
+	// TODO: Remove hack
+	klog.Errorf("Tear down interface (%+v) %s", *pr, podDesc)
+
+	stdout, err := ovsGet("Open_vSwitch", ".", "other_config", "dpdk-init")
+	if err != nil {
+		return fmt.Errorf("failed to get OVS' other_config:dpdk-init, error: %v", err)
+	}
+	ovsDPDKInit := (stdout == "true")
+
+	dpType, err := getDatapathType("br-int")
+	if err != nil {
+		return fmt.Errorf("failed to get datapath type for bridge br-int : %v", err)
+	}
+
+	if dpType != types.DatapathSystem && dpType != types.DatapathUserspace {
+		return fmt.Errorf("br-int has unknown datapath type: %v", dpType)
+	}
+
+	if dpType == types.DatapathUserspace && ifInfo.IsDPUHostMode {
+		return fmt.Errorf("unexpected configuration, pod request on dpu host with netdev datapath")
+	}
+
+	isVDUSE := ovsDPDKInit && (dpType == types.DatapathUserspace)
+
 	if ifInfo.IsDPUHostMode {
 		if pr.CNIConf.DeviceID == "" {
 			klog.Warningf("Unexpected configuration %s, pod request on DPU host. device ID must be provided", podDesc)
@@ -686,8 +967,9 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 
 	ifnameSuffix := ""
 	isSecondary := pr.netName != types.DefaultNetworkName
+
 	// nothing needs to be done for the VFIO case in the container namespace
-	if !pr.IsVFIO {
+	if !pr.IsVFIO && (dpType != types.DatapathUserspace) {
 		netns, err := ns.GetNS(pr.Netns)
 		if err != nil {
 			return fmt.Errorf("failed to get container namespace %s: %v", podDesc, err)
@@ -748,10 +1030,21 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 		var err error
 		// host side interface deletion
 		var hostIfName string
-		if !util.IsNetworkSegmentationSupportEnabled() || isSecondary {
-			// this is a secondary network (not primary) or segmentation is not enabled
-			hostIfName = pr.SandboxID[:(15-len(ifnameSuffix))] + ifnameSuffix
+
+		if isVDUSE {
+			hostIfName, err = prepareVDUSEInterfaceName(pr.SandboxID, pr.netName)
+			if err != nil {
+				klog.Errorf("Failed to regenerate vduse device name for pod %s: %v", podDesc, err)
+			}
+			// TODO: Remove hack!
+			klog.Errorf("Removing vduse dev %s (pr.netName: %s, ifInfo.NetName: %s)", hostIfName, pr.netName, ifInfo.NetName)
+		} else {
+			if !util.IsNetworkSegmentationSupportEnabled() || isSecondary {
+				// this is a secondary network (not primary) or segmentation is not enabled
+				hostIfName = pr.SandboxID[:(15-len(ifnameSuffix))] + ifnameSuffix
+			}
 		}
+
 		if pr.CNIConf.DeviceID != "" {
 			hostIfName, err = util.GetFunctionRepresentorName(pr.CNIConf.DeviceID)
 			if err != nil {
@@ -764,10 +1057,10 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 			return fmt.Errorf("failed to list interfaces in OVS during delete for sandbox: %s, err: %w",
 				pr.SandboxID, err)
 		}
-		// hostIfName is not empty if using device ID, a secondary network, or segmentation not enabled
+		// hostIfName is not empty if using device ID, using VDUSE, a secondary network, or segmentation not enabled
 		// delete the port in traditional fashion
 		if hostIfName != "" {
-			pr.deletePort(hostIfName, pr.PodNamespace, pr.PodName)
+			pr.deletePort(hostIfName, pr.PodNamespace, pr.PodName, isVDUSE)
 		} else {
 			// this is a primary interface deletion and segmentation is enabled, delete all ports
 			// delete happens in reverse order for attached networks, so this is the final deletion
@@ -777,7 +1070,7 @@ func (*defaultPodRequestInterfaceOps) UnconfigureInterface(pr *PodRequest, ifInf
 				klog.V(5).Infof("Removing multiple interfaces for primary network segmentation (%+v) %s: %s",
 					*pr, podDesc, strings.Join(portList, ","))
 			}
-			pr.deletePorts(portList, pr.PodNamespace, pr.PodName)
+			pr.deletePorts(portList, pr.PodNamespace, pr.PodName, isVDUSE)
 		}
 		err = clearPodBandwidthForPorts(portList, pr.SandboxID)
 		if err != nil {
@@ -815,8 +1108,15 @@ func (pr *PodRequest) deletePodConntrack() {
 	}
 }
 
-func (pr *PodRequest) deletePort(ifaceName, podNamespace, podName string) {
+func (pr *PodRequest) deletePort(ifaceName, podNamespace, podName string, isVDUSE bool) {
 	podDesc := fmt.Sprintf("%s/%s", podNamespace, podName)
+
+	if isVDUSE {
+		err := kvdpa.DeleteVdpaDevice(ifaceName)
+		if err != nil {
+			klog.Warningf("failure while deleting vDPA device %s for pod %q: : %v", ifaceName, podDesc, err)
+		}
+	}
 
 	out, err := ovsExec("del-port", "br-int", ifaceName)
 	if err != nil && !strings.Contains(err.Error(), "no port named") {
@@ -824,15 +1124,19 @@ func (pr *PodRequest) deletePort(ifaceName, podNamespace, podName string) {
 		klog.Warningf("Failed to delete pod %q OVS port %s: %v\n  %q", podDesc, ifaceName, err, string(out))
 	}
 	// skip deleting representor ports
-	if pr.CNIConf.DeviceID == "" {
+	if pr.CNIConf.DeviceID != "" {
+		return
+	}
+
+	if !isVDUSE {
 		if err = util.LinkDelete(ifaceName); err != nil {
 			klog.Warningf("Failed to delete pod %q interface %s: %v", podDesc, ifaceName, err)
 		}
 	}
 }
 
-func (pr *PodRequest) deletePorts(ifaces []string, podNamespace, podName string) {
+func (pr *PodRequest) deletePorts(ifaces []string, podNamespace, podName string, isVDUSE bool) {
 	for _, iface := range ifaces {
-		pr.deletePort(iface, podNamespace, podName)
+		pr.deletePort(iface, podNamespace, podName, isVDUSE)
 	}
 }

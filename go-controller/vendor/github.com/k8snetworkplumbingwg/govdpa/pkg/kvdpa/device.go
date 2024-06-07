@@ -163,6 +163,13 @@ We also check the virtio device exists in the virtio bus:
 	virtio{N} -> ../../../devices/pci0000:00/0000:00:03.2/0000:05:00.2/virtio{N}
 */
 func (vd *vdpaDev) getVirtioVdpaDev() (VirtioNet, error) {
+	/* TODO: hack because virtio{N} for vduse is in device path, not parent path */
+	vdpaDevicePath := filepath.Join(vdpaBusDevDir, vd.name)
+	virtioNet, err := GetVirtioNetInPath(vdpaDevicePath)
+	if err == nil {
+		return virtioNet, err
+	}
+
 	parentPath, err := vd.ParentDevicePath()
 	if err != nil {
 		return nil, err

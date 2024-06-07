@@ -520,7 +520,7 @@ func TestSetupInterface(t *testing.T) {
 			ovntest.ProcessMockFnList(&mockCNIPlugin.Mock, tc.cniPluginMockHelper)
 			ovntest.ProcessMockFnList(&mockNS.Mock, tc.nsMockHelper)
 
-			hostIface, contIface, err := setupInterface(tc.inpNetNS, tc.inpContID, tc.inpIfaceName, tc.inpPodIfaceInfo)
+			hostIface, contIface, err := setupVethInterface(tc.inpNetNS, tc.inpContID, tc.inpIfaceName, tc.inpPodIfaceInfo)
 			t.Log(hostIface, contIface, err)
 			if tc.errExp {
 				require.Error(t, err)
@@ -1504,7 +1504,7 @@ func TestConfigureOVS(t *testing.T) {
 			fakeClient := fake.NewSimpleClientset(&corev1.PodList{Items: []corev1.Pod{pod}})
 			clientset := NewClientSet(fakeClient, &podLister)
 			err = ConfigureOVS(ctx, tc.podNs, tc.podName, tc.vfRep,
-				tc.ifInfo, sandboxID, vfPciAddress, clientset)
+				tc.ifInfo, sandboxID, vfPciAddress, clientset, false, false)
 			if tc.errMatch != nil {
 				assert.Contains(t, err.Error(), tc.errMatch.Error())
 			} else {
@@ -1639,7 +1639,7 @@ func TestConfigureOVS_getPfEncapIpWithError(t *testing.T) {
 			var podLister v1mocks.PodLister
 			podLister.On("Pods", mock.AnythingOfType("string")).Return(&podNamespaceLister)
 			err = ConfigureOVS(ctx, tc.podNs, tc.podName, tc.vfRep,
-				tc.ifInfo, sandboxID, vfPciAddress, nil)
+				tc.ifInfo, sandboxID, vfPciAddress, nil, false, false)
 			if tc.errMatch != nil {
 				assert.Contains(t, err.Error(), tc.errMatch.Error())
 			} else {

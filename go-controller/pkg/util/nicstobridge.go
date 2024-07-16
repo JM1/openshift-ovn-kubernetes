@@ -57,7 +57,7 @@ func GetNicName(brName string) (string, error) {
 		return "", err
 	}
 
-	systemPorts := make([]string, 0)
+	systemOrDpdkPorts := make([]string, 0)
 	for port, ifaces := range portsToInterfaces {
 		for _, iface := range ifaces {
 			stdout, stderr, err = RunOVSVsctl("get", "Interface", strings.TrimSpace(iface), "Type")
@@ -66,17 +66,17 @@ func GetNicName(brName string) (string, error) {
 					iface, brName, stderr, err)
 
 			}
-			// If system Type we know this is the OVS port is the NIC
-			if stdout == "system" {
-				systemPorts = append(systemPorts, port)
+			// If system Type or dpdk Type we know this OVS port is the NIC
+			if stdout == "system" || stdout == "dpdk" {
+				systemOrDpdkPorts = append(systemOrDpdkPorts, port)
 			}
 		}
 	}
-	if len(systemPorts) == 1 {
-		return systemPorts[0], nil
-	} else if len(systemPorts) > 1 {
-		klog.Infof("Found more than one system Type ports on the OVS bridge %s, so skipping "+
-			"this method of determining the uplink port", brName)
+	if len(systemOrDpdkPorts) == 1 {
+		return systemOrDpdkPorts[0], nil
+	} else if len(systemOrDpdkPorts) > 1 {
+		klog.Infof("Found more than one ports of type 'system' or 'dpdk' on the OVS bridge %s, "+
+			"so skipping this method of determining the uplink port", brName)
 	}
 
 	// Check for bridge-uplink to indicate the NIC

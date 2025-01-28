@@ -9,6 +9,7 @@ import (
 	"hash/fnv"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -312,6 +313,37 @@ func setupVDUSEInterface(netns ns.NetNS, containerID, ifName string, ifInfo *Pod
 	// if err != nil {
 	//	return nil, nil, fmt.Errorf("failed to attach %s to vDPA bus: %s", hostIfaceName, err)
 	// }
+
+	{
+		driverLink, err := os.Readlink(fmt.Sprintf("/sys/bus/vdpa/devices/%s/driver", hostIfaceName))
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read link for VDUSE dev %s: %%%s", hostIfaceName, err)
+		}
+
+		driverName := filepath.Base(driverLink)
+		klog.V(5).Infof("VDUSE dev %s is currently bound to driver %s", hostIfaceName, driverName)
+
+		if driverName != "virtio_vdpa" {
+			// Unbind VDUSE device from current driver
+			err = os.WriteFile(
+				fmt.Sprintf("/sys/bus/vdpa/devices/%s/driver/unbind", hostIfaceName),
+				[]byte(hostIfaceName), 0000)
+
+			// Always use virtio_vdpa driver for VDUSE devices
+			err = os.WriteFile(
+				fmt.Sprintf("/sys/bus/vdpa/devices/%s/driver_override", hostIfaceName),
+				[]byte("virtio_vdpa"), 0000)
+			if err != nil {
+				return nil, nil, fmt.Errorf("could not set driver_override for VDUSE dev %s: %v", hostIfaceName, err)
+			}
+
+			// Probe driver
+			err = os.WriteFile("/sys/bus/vdpa/drivers_probe", []byte(hostIfaceName), 0000)
+			if err != nil {
+				return nil, nil, fmt.Errorf("could not probe driver for VDUSE dev %s: %v", hostIfaceName, err)
+			}
+		}
+	}
 
 	vdpaDevs, err := kvdpa.GetVdpaDevicesByMgmtDev("", "vduse")
 	if err != nil {
